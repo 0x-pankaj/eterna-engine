@@ -94,6 +94,38 @@ The leader lock makes split-brain *rare*; the single-writer offset and the id
 primary key make it *harmless*. A production system would add fencing tokens to
 close the window entirely (see §4).
 
+#### Recovery and stale orders on replay
+
+Resume-from-offset (above) is correct for a *brief* crash. A *long* matcher
+outage raises a second, subtler problem. The intake stream is a queue of orders
+the system already **accepted** — we returned `202 {id}` to each caller. After an
+hour-long outage that queue holds an hour of backlog, and blindly replaying it
+executes hour-old orders against *today's* book. For a prediction market, where
+the event itself may have moved, that fills users on stale intent. This is a
+fairness/correctness hazard, not a crash — and because the orders were accepted,
+they can't be silently dropped: any expiry must be a **recorded, observable
+outcome**, not a gap.
+
+The current code replays the whole backlog unconditionally. Two complementary
+guards would fix it; both are deliberately *documented, not built* (see §4 — the
+spec defines no time-in-force semantics, and thresholds plus the client-facing
+expiry event are product decisions, not ones to guess):
+
+- **Per-order staleness expiry (the right granularity).** The Redis stream id
+  already encodes ingest time — it's `<ms>-<seq>`, so the milliseconds are free,
+  **with zero schema change**. On replay, an entry older than `MAX_ORDER_AGE_MS`
+  is *expired* (recorded `status = 'expired'`, an expiry event emitted, never
+  matched or rested) instead of executed; fresh entries process normally. It
+  costs nothing in steady state — live orders are milliseconds old — and only
+  bites after downtime. Note this is *per-order*, not a blunt "don't replay if
+  downtime > X": a global switch would wrongly expire the fresh orders that
+  arrived just before recovery too.
+- **Global circuit-breaker (catastrophic outage).** If the *oldest* unprocessed
+  entry exceeds a much larger limit, the matcher refuses to auto-replay at all —
+  it halts and alerts an operator. When something is that wrong, a human decision
+  beats auto-executing a massive stale backlog. Per-order expiry handles the
+  routine case; the breaker is the "something is very wrong" backstop.
+
 ### 2. What data structure did you use for the order book, and why?
 
 Per side, a **`BTreeMap<price, VecDeque<RestingOrder>>`** (`crates/engine/src/book.rs`).
@@ -145,10 +177,13 @@ In priority order:
 3. **Sequenced, gap-recoverable WS feed.** Monotonic fill sequence numbers plus a
    snapshot endpoint so a reconnecting client detects and backfills gaps. Today the
    live feed is best-effort and Postgres `fills` is the source of truth.
-4. **Fencing tokens** on leadership to close the split-brain window entirely,
+4. **Stale-order guards on replay** (see §1) — per-order staleness expiry keyed
+   off the stream-id timestamp, plus a global circuit-breaker for catastrophic
+   outages, so a long matcher downtime never auto-executes a stale backlog.
+5. **Fencing tokens** on leadership to close the split-brain window entirely,
    instead of relying on the id-PK backstop.
-5. **Cancel / amend**, which needs an id→location index alongside the book.
-6. **Operational polish:** Kafka as a partitioned, replayable intake log;
+6. **Cancel / amend**, which needs an id→location index alongside the book.
+7. **Operational polish:** Kafka as a partitioned, replayable intake log;
    CloudWatch metrics; property-based tests for the matching invariants.
 
 ---
@@ -249,6 +284,7 @@ One Dockerfile builds both binaries; the `SERVICE` env var selects which runs.
 ## Deliberately out of scope
 
 Auth, cancel/amend, multiple markets, rate limiting, exactly-once live WS delivery
-(the feed is best-effort; `fills` in Postgres is authoritative), Kafka, and full
-fencing-token leadership. These are scope cuts for a take-home, called out here
-rather than hidden.
+(the feed is best-effort; `fills` in Postgres is authoritative), order time-in-force
+/ stale-replay guards (replay is currently unconditional — see §1 and §4), Kafka,
+and full fencing-token leadership. These are scope cuts for a take-home, called out
+here rather than hidden.

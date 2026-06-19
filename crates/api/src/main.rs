@@ -9,11 +9,16 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use shared::{Bus, Config, NewOrder, Order, OrderAck};
+use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
 
+mod ws;
+
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     bus: Bus,
+    /// Local fan-out of fills received from Redis to this instance's WS clients.
+    fills: broadcast::Sender<String>,
 }
 
 #[tokio::main]
@@ -26,12 +31,22 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = Config::from_env();
     let bus = Bus::connect(&cfg.redis_url).await?;
-    let state = AppState { bus };
+
+    // One subscriber per instance feeds a broadcast channel shared by all of
+    // this instance's WebSocket clients.
+    let (fills_tx, _) = broadcast::channel(1024);
+    ws::spawn_fanout(bus.clone(), fills_tx.clone());
+
+    let state = AppState {
+        bus,
+        fills: fills_tx,
+    };
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/orders", post(post_order))
         .route("/orderbook", get(get_orderbook))
+        .route("/ws", get(ws::ws_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;

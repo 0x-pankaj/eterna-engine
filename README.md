@@ -157,6 +157,27 @@ constraint is the **synchronous Postgres transaction per order** — commit/fsyn
 latency sets the ceiling on matches/sec, and it's one core, one machine. Adding API
 instances does nothing for this; they were never the bottleneck.
 
+It's worth being precise about *which* Postgres operation is the limit, because
+it's not what people first guess:
+
+- **Reads are off the hot path entirely.** `GET /orderbook` reads the Redis
+  snapshot, not Postgres; the matcher reads Postgres only once, at startup
+  (`load_open_orders`). So high request volume doesn't pressure the database —
+  this is a pure *write* problem.
+- **It's fsync-bound, not CPU-bound.** The in-memory engine matches millions of
+  orders/sec; that is never the limit. One synchronous `commit` per order is an
+  fsync, and a single Postgres node does on the order of a few thousand small
+  commits/sec (more on NVMe / with a battery-backed write cache). That fsync rate
+  caps the whole system, however fast matching itself is.
+- **The tables grow unbounded.** `orders` and `fills` only ever grow; under
+  sustained load you'd time-partition `fills`, archive cold rows to S3, and keep
+  only open orders hot, or autovacuum and bloat become their own ceiling.
+
+The fixes, in leverage order: **batch the writes** (§4 — amortize one fsync across
+a whole `XREAD` batch, 10–100× fewer commits), **shard by market** (§4 — scale
+writes horizontally), and at the extreme treat Postgres as an *async projection*
+of the durable Redis log rather than an inline write on the hot path.
+
 Secondary pressures, in rough order: the per-batch full-book snapshot write to
 Redis is O(book depth); the single `orders` stream key is a write hotspot; and the
 Postgres connection/transaction rate. The system **degrades gracefully** — stream
@@ -172,8 +193,12 @@ In priority order:
    the real horizontal-throughput unlock and the data model is one `market_id`
    away from it.
 2. **Batch persistence.** One transaction per `XREAD` batch instead of per order,
-   plus pipelined fill publishes — directly lifts the per-order commit ceiling
-   that §3 identifies.
+   plus pipelined fill publishes. This amortizes a single fsync across the whole
+   batch (10–100× fewer commits) and is the cheapest, highest-leverage fix for the
+   Postgres write/fsync ceiling that §3 identifies — the matcher already reads
+   orders in batches, so it's a small change. Crash safety is unchanged: the batch
+   still commits its fills and the consumed offset atomically, so recovery stays
+   exactly-once; the batch just gets larger.
 3. **Sequenced, gap-recoverable WS feed.** Monotonic fill sequence numbers plus a
    snapshot endpoint so a reconnecting client detects and backfills gaps. Today the
    live feed is best-effort and Postgres `fills` is the source of truth.

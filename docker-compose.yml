@@ -1,0 +1,26 @@
+# Local dependencies for development and integration tests.
+# The API and matcher binaries run on the host (cargo run) against these.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: eterna
+      POSTGRES_PASSWORD: eterna
+      POSTGRES_DB: eterna
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eterna"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20

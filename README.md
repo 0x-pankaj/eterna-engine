@@ -20,25 +20,39 @@ incoming orders and apply them one at a time. So the system scales the parts tha
 the one part that *can't* — matching — as a single, serialized consumer.
 
 ```
- HTTP clients
-     │ POST /orders            GET /orderbook            WS /ws
-     ▼                              ▼                       ▲
- ┌─────────── API instances ×N (stateless, Axum) ───────────┐
- │  INCR order:seq → XADD orders   read snapshot   broadcast │
- └───┬──────────────────────────────────┬───────────────────┘
-     │ XADD                              │ SUBSCRIBE fills
-     ▼                                   │
-  Redis Stream "orders"  ── ordered intake log ──┐
-     │ XREAD (only the leader)                    │
-     ▼                                            │
- ┌─────────── matcher (leader-elected, 1 active) ─┤
- │  in-memory OrderBook (price-time) → Fills      │
- │  one txn: fills + maker deltas + offset (PG)   │
- │  PUBLISH fills ───────────────────────────────-┘
- │  write orderbook snapshot (Redis)
-     ▼
-  Postgres — durable orders, fills, consumed stream offset
+ HTTP / WS clients
+      │ POST /orders           │ GET /orderbook          ▲ WS /ws  (server pushes fills)
+      ▼                        ▼                         │
+ ┌──────────────────── API instances ×N  (stateless, Axum) ───────────────────────┐
+ │   INCR id → XADD orders       GET snapshot           SUBSCRIBE fills → broadcast │
+ └────────────────────────────────────────────────────────────────────────────────┘
+      │ XADD                   ▲ GET snapshot            ▲ fill messages
+      ▼                        │                         │
+ ┌─────────────────────────────────── Redis ─────────────────────────────────────┐
+ │   Stream "orders"         key "orderbook:snapshot"          Pub/Sub "fills"     │
+ └────────────────────────────────────────────────────────────────────────────────┘
+      │ XREAD (leader only)    ▲ SET snapshot            ▲ PUBLISH fills
+      ▼                        │                         │
+ ┌──────────────────── matcher  (leader-elected, 1 active) ───────────────────────┐
+ │   engine.submit(order)  →  fills                                               │
+ │   ① one Postgres txn:  fills + maker deltas + taker + offset   →  commit       │
+ │   ② after commit:   SET snapshot      +      PUBLISH fills                     │
+ └────────────────────────────────────────────────────────────────────────────────┘
+      │ persist
+      ▼
+ Postgres — durable orders, fills, consumed stream offset
 ```
+
+Three separate Redis roles, deliberately not conflated: the **`orders` stream**
+(ordered intake, matcher-only consumer), the **`orderbook:snapshot` key** (read
+model for `GET /orderbook`), and the **`fills` pub/sub channel** (fan-out).
+
+**Fill path — how `/ws` is fed:** the matcher matches in memory, commits to
+Postgres, then `PUBLISH`es each fill to the Redis **`fills` channel** → *every* API
+instance has one subscriber that pushes fills into a local `tokio::broadcast` →
+each connected WebSocket client forwards them on. So a client on *any* instance
+sees every fill, the matcher never tracks clients, and fills travel a *different*
+Redis path than the `orders` intake stream.
 
 Three crates do the work, behind a `shared` infrastructure crate:
 
